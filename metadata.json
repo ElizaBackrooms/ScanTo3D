@@ -1,0 +1,6 @@
+{
+  "name": "LidarForge 3D",
+  "description": "Android 3D LiDAR and spatial room scanner with interactive 3D viewport, crop box, mesh density, measurements, and Bryce 3D & Blender multi-format export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
