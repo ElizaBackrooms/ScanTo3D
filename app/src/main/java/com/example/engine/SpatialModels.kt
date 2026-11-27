@@ -203,7 +203,8 @@ data class SpatialScanPackage(
     val rawPoints: List<SpatialPoint>,
     val cornerAnchors: List<Vec3>,
     val ceilingHeightMeters: Float,
-    val mesh: SpatialMesh
+    val mesh: SpatialMesh,
+    val capturedTriangles: IntArray = IntArray(0)
 )
 
 enum class ExportFormat(

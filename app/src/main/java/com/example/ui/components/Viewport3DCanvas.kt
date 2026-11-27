@@ -450,11 +450,13 @@ private fun DrawScope.drawTrianglesSorted(
     extras: StudioSkinExtras
 ) {
     val triCount = mesh.triangleCount
-    // Cap drawn triangles gracefully on extremely dense meshes for guaranteed 60fps interaction
-    val stride = (triCount / 3600).coerceAtLeast(1)
-    val order = ArrayList<Int>(min(triCount, 3600))
+    // Keep up to 10,000 contiguous visible triangles (avoids Swiss-cheese skipping)
+    val maxDrawn = 10_000
+    val order = ArrayList<Int>(min(triCount, maxDrawn))
     val depths = FloatArray(triCount)
 
+    // First collect all on-screen visible triangles
+    val stride = if (triCount > maxDrawn * 2) (triCount / maxDrawn).coerceAtLeast(1) else 1
     var t = 0
     while (t < triCount) {
         val base = t * 3
@@ -462,8 +464,16 @@ private fun DrawScope.drawTrianglesSorted(
         val i1 = mesh.indices[base + 1]
         val i2 = mesh.indices[base + 2]
         if (projVis[i0] && projVis[i1] && projVis[i2]) {
-            depths[t] = (projZ[i0] + projZ[i1] + projZ[i2]) * 0.3333f
-            order.add(t)
+            val x0 = projX[i0]; val y0 = projY[i0]
+            val x1 = projX[i1]; val y1 = projY[i1]
+            val x2 = projX[i2]; val y2 = projY[i2]
+            if (!(max(x0, max(x1, x2)) < -30f || min(x0, min(x1, x2)) > size.width + 30f ||
+                    max(y0, max(y1, y2)) < -30f || min(y0, min(y1, y2)) > size.height + 30f)
+            ) {
+                depths[t] = (projZ[i0] + projZ[i1] + projZ[i2]) * 0.3333f
+                order.add(t)
+                if (order.size >= maxDrawn) break
+            }
         }
         t += stride
     }
@@ -471,7 +481,7 @@ private fun DrawScope.drawTrianglesSorted(
 
     val lightDir = Vec3(0.45f, 0.78f, 0.43f).normalize()
     val path = Path()
-    val edgeAlpha = if (extras.skin == StudioThemeSkin.WINDOWS_98) 0.24f else 0.18f
+    val edgeAlpha = if (thermal) 0.16f else 0.06f
 
     for (triIdx in order) {
         val base = triIdx * 3
@@ -483,22 +493,17 @@ private fun DrawScope.drawTrianglesSorted(
         val x1 = projX[i1]; val y1 = projY[i1]
         val x2 = projX[i2]; val y2 = projY[i2]
 
-        // Skip off-screen triangles
-        if (max(x0, max(x1, x2)) < -40f || min(x0, min(x1, x2)) > size.width + 40f ||
-            max(y0, max(y1, y2)) < -40f || min(y0, min(y1, y2)) > size.height + 40f
-        ) continue
-
         val nx = (mesh.normals[i0 * 3] + mesh.normals[i1 * 3] + mesh.normals[i2 * 3]) * 0.3333f
         val ny = (mesh.normals[i0 * 3 + 1] + mesh.normals[i1 * 3 + 1] + mesh.normals[i2 * 3 + 1]) * 0.3333f
         val nz = (mesh.normals[i0 * 3 + 2] + mesh.normals[i1 * 3 + 2] + mesh.normals[i2 * 3 + 2]) * 0.3333f
         val ndotl = abs(nx * lightDir.x + ny * lightDir.y + nz * lightDir.z)
-        val shade = (0.42f + 0.58f * ndotl).coerceIn(0.35f, 1.0f)
+        val shade = (0.58f + 0.42f * ndotl).coerceIn(0.48f, 1.0f)
 
         val inside = !showCropDim || (isInsideBox(mesh, i0, cropWorld) && isInsideBox(mesh, i1, cropWorld) && isInsideBox(mesh, i2, cropWorld))
 
         val fillColor = if (thermal) {
             val normD = ((depths[triIdx] - minZ) / zSpan).coerceIn(0f, 1f)
-            thermalColor(normD, extras).copy(alpha = if (inside) 0.86f else 0.16f)
+            thermalColor(normD, extras).copy(alpha = if (inside) 0.88f else 0.16f)
         } else {
             val c0 = mesh.colors[i0]
             val c1 = mesh.colors[i1]
@@ -506,7 +511,7 @@ private fun DrawScope.drawTrianglesSorted(
             val r = (((AndroidColor.red(c0) + AndroidColor.red(c1) + AndroidColor.red(c2)) / 3f) * shade).roundToInt().coerceIn(0, 255)
             val g = (((AndroidColor.green(c0) + AndroidColor.green(c1) + AndroidColor.green(c2)) / 3f) * shade).roundToInt().coerceIn(0, 255)
             val b = (((AndroidColor.blue(c0) + AndroidColor.blue(c1) + AndroidColor.blue(c2)) / 3f) * shade).roundToInt().coerceIn(0, 255)
-            Color(r, g, b, if (inside) 235 else 42)
+            Color(r, g, b, if (inside) 250 else 42)
         }
 
         path.reset()
@@ -515,11 +520,13 @@ private fun DrawScope.drawTrianglesSorted(
         path.lineTo(x2, y2)
         path.close()
         drawPath(path, color = fillColor)
-        drawPath(
-            path,
-            color = extras.wireframeColor.copy(alpha = if (inside) edgeAlpha else 0.05f),
-            style = Stroke(width = 0.85f)
-        )
+        if (inside) {
+            drawPath(
+                path,
+                color = extras.wireframeColor.copy(alpha = edgeAlpha),
+                style = Stroke(width = 0.65f)
+            )
+        }
     }
 }
 

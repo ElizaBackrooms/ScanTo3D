@@ -10,12 +10,6 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -32,6 +26,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.AddLocationAlt
@@ -55,8 +50,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -79,8 +74,10 @@ import com.example.engine.MeasurementUnit
 import com.example.engine.SpatialPoint
 import com.example.engine.Vec3
 import com.example.scanner.ArCoreScannerRenderer
+import com.example.scanner.CapturedMeshPatch
+import com.example.scanner.LiveMeshAccumulator
+import com.example.scanner.ScreenEdge2D
 import com.example.scanner.ScreenPlaneOverlay
-import com.example.scanner.ScreenPoint2D
 import com.example.scanner.SensorReadiness
 import com.example.scanner.SpatialCaptureController
 import com.example.ui.CaptureDensity
@@ -105,7 +102,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 enum class ScannerEngineMode(val label: String) {
-    ARCORE_DEPTH("ARCore 6-DoF + Depth16 (Auto)"),
+    ARCORE_DEPTH("ARCore Live Mesh + Depth16 (Auto)"),
     CAMERAX_IMU("CameraX + 6-DoF IMU"),
     IMU_CORNER_ONLY("Corner Raycast Only")
 }
@@ -113,6 +110,7 @@ enum class ScannerEngineMode(val label: String) {
 @Composable
 fun ScannerScreen(
     uiState: ScannerUiState,
+    liveAccumulator: LiveMeshAccumulator,
     sensorReadiness: SensorReadiness,
     currentSkin: StudioThemeSkin,
     currentUnit: MeasurementUnit,
@@ -120,9 +118,10 @@ fun ScannerScreen(
     onSelectUnit: (MeasurementUnit) -> Unit,
     onBack: () -> Unit,
     onToggleScan: () -> Unit,
-    onPointsCaptured: (List<SpatialPoint>) -> Unit,
+    onPatchCaptured: (CapturedMeshPatch) -> Unit,
     onAnchorCorner: (Vec3) -> Unit,
     onUndo: () -> Unit,
+    onClearScan: () -> Unit,
     onEyeHeightChange: (Float) -> Unit,
     onCeilingHeightChange: (Float) -> Unit,
     onDensityChange: (CaptureDensity) -> Unit,
@@ -147,7 +146,7 @@ fun ScannerScreen(
     var arFallbackReason by remember { mutableStateOf<String?>(null) }
     var showCalibration by remember { mutableStateOf(false) }
     var showRadarHud by remember { mutableStateOf(true) }
-    var showArOverlay by remember { mutableStateOf(true) }
+    var showLiveMesh by remember { mutableStateOf(true) }
     var showStartMenu by remember { mutableStateOf(false) }
     var cameraBindError by remember { mutableStateOf<String?>(null) }
 
@@ -165,11 +164,12 @@ fun ScannerScreen(
         engineMode == ScannerEngineMode.ARCORE_DEPTH &&
         arFallbackReason == null
 
-    // 1. Real ARCore 6-DoF SLAM + Depth16 + Plane + HitTest Engine
-    val arRenderer = remember(context) {
+    // 1. Real ARCore 6-DoF + Dense DEPTH16 + 60 FPS Live OpenGL Mesh Painter
+    val arRenderer = remember(context, liveAccumulator) {
         ArCoreScannerRenderer(
             context = context,
-            onPointsCaptured = onPointsCaptured,
+            liveAccumulator = liveAccumulator,
+            onPatchCaptured = onPatchCaptured,
             onArUnavailable = { reason ->
                 arFallbackReason = reason
                 if (engineMode == ScannerEngineMode.ARCORE_DEPTH) {
@@ -180,13 +180,12 @@ fun ScannerScreen(
     }
     val arTelemetry by arRenderer.telemetry.collectAsState()
 
-    // 2. Upgraded CameraX + IMU Fallback Engine
+    // 2. Upgraded CameraX + IMU Fallback Engine (emits connected grid mesh patches)
     val captureController = remember(context) {
-        SpatialCaptureController(context = context, onPointsCaptured = onPointsCaptured)
+        SpatialCaptureController(context = context, onPatchCaptured = onPatchCaptured)
     }
     val imuPose by captureController.imuPose.collectAsState()
 
-    // Sync scanning state & parameters into both engines
     LaunchedEffect(
         uiState.isScanning,
         uiState.isPaused,
@@ -194,14 +193,14 @@ fun ScannerScreen(
         uiState.ceilingHeightMeters,
         uiState.captureDensity,
         uiState.cornerAnchors,
-        uiState.previewPoints,
+        showLiveMesh,
         useArCore
     ) {
         val active = uiState.isScanning && !uiState.isPaused
         arRenderer.isActivelyCapturing = active && useArCore
+        arRenderer.showLiveMeshOverlay = showLiveMesh
         arRenderer.sampleStep = uiState.captureDensity.sampleStep
         arRenderer.currentCornerAnchors = uiState.cornerAnchors
-        arRenderer.previewWorldPoints = uiState.previewPoints
 
         captureController.isActivelyCapturing = active && !useArCore
         captureController.eyeHeightMeters = uiState.eyeHeightMeters
@@ -237,16 +236,14 @@ fun ScannerScreen(
     val activeTier = when {
         useArCore && arTelemetry.isArActive -> arTelemetry.depthModeLabel
         engineMode == ScannerEngineMode.IMU_CORNER_ONLY || cameraBindError != null -> "IMU Corner Raycast"
-        else -> "CameraX + 6-DoF IMU"
+        else -> "CameraX + IMU Mesh"
     }
 
     val anchorCenterCorner: () -> Unit = {
         if (useArCore) {
             arRenderer.requestCenterCornerHit { hit ->
                 val pt = hit ?: arTelemetry.reticleWorldPoint
-                if (pt != null) {
-                    onAnchorCorner(pt)
-                }
+                if (pt != null) onAnchorCorner(pt)
             }
         } else {
             onAnchorCorner(captureController.raycastFloorCorner())
@@ -260,7 +257,7 @@ fun ScannerScreen(
         uiState.captureDensity,
         showCalibration,
         showRadarHud,
-        showArOverlay,
+        showLiveMesh,
         engineMode
     ) {
         listOf(
@@ -268,21 +265,23 @@ fun ScannerScreen(
                 title = "Capture",
                 entries = listOf(
                     RetroMenuEntry(
-                        label = if (uiState.isScanning && !uiState.isPaused) "Pause Capture" else "Start Capture",
+                        label = if (uiState.isScanning && !uiState.isPaused) "Pause Painting" else "Start Painting Mesh",
                         onClick = onToggleScan
                     ),
+                    RetroMenuEntry("Anchor Corner at Reticle", onClick = anchorCenterCorner),
                     RetroMenuEntry(
-                        label = "Anchor Corner at Reticle",
-                        onClick = anchorCenterCorner
-                    ),
-                    RetroMenuEntry(
-                        label = "Undo Last Segment",
+                        label = "Undo Last Patch",
                         enabled = uiState.pointCount > 0 || uiState.cornerAnchors.isNotEmpty(),
                         onClick = onUndo
                     ),
+                    RetroMenuEntry(
+                        label = "Clear & Restart Scan",
+                        enabled = uiState.pointCount > 0 || uiState.cornerAnchors.isNotEmpty(),
+                        onClick = onClearScan
+                    ),
                     RetroMenuEntry("", isDivider = true),
                     RetroMenuEntry(
-                        label = "Finish & Build 3D Mesh",
+                        label = "Finish & Open 3D Studio",
                         enabled = uiState.canFinish,
                         onClick = { onFinishScan(activeTier) }
                     ),
@@ -293,7 +292,7 @@ fun ScannerScreen(
                 title = "Density",
                 entries = CaptureDensity.entries.map { d ->
                     RetroMenuEntry(
-                        label = "${d.label} (${d.defaultVoxelCm} cm voxel)",
+                        label = d.label,
                         checked = uiState.captureDensity == d,
                         onClick = { onDensityChange(d) }
                     )
@@ -313,33 +312,31 @@ fun ScannerScreen(
             RetroMenuCategory(
                 title = "View",
                 entries = listOf(
-                    RetroMenuEntry("Calibration Drawer", checked = showCalibration, onClick = { showCalibration = !showCalibration }),
-                    RetroMenuEntry("Live 3D Mesh & Plane Overlay", checked = showArOverlay, onClick = { showArOverlay = !showArOverlay }),
-                    RetroMenuEntry("Mini-Radar HUD", checked = showRadarHud, onClick = { showRadarHud = !showRadarHud })
+                    RetroMenuEntry("Live 3D Mesh Blanket", checked = showLiveMesh, onClick = { showLiveMesh = !showLiveMesh }),
+                    RetroMenuEntry("Mini-Radar HUD", checked = showRadarHud, onClick = { showRadarHud = !showRadarHud }),
+                    RetroMenuEntry("Calibration Drawer", checked = showCalibration, onClick = { showCalibration = !showCalibration })
                 )
             )
         )
     }
 
-    // Unified HUD pose & projected overlays for either ARCore or CameraX+IMU fallback
+    val isActivelyPainting = uiState.isScanning && !uiState.isPaused
     val displayYawRad = if (useArCore) arTelemetry.yawRad else imuPose.yawRad
     val displayYawDeg = ((displayYawRad * 180f / PI.toFloat()) % 360f + 360f) % 360f
     val displayPitchDeg = if (useArCore) arTelemetry.pitchRad * 180f / PI.toFloat() else imuPose.pitchDegrees
     val reticleDist = if (useArCore) arTelemetry.reticleDistanceMeters else captureController.estimateReticleDistance()
     val reticleSrc = if (useArCore) arTelemetry.reticleHitSource else "PLANE"
 
-    val overlayPlanes: List<ScreenPlaneOverlay> = if (useArCore && showArOverlay) {
+    val overlayPlanes: List<ScreenPlaneOverlay> = if (useArCore && showLiveMesh) {
         arTelemetry.projectedPlanes
     } else emptyList()
 
-    val overlayPoints: List<ScreenPoint2D> = when {
-        !showArOverlay -> emptyList()
-        useArCore -> arTelemetry.projectedPoints
-        else -> captureController.projectPointsToScreen(uiState.previewPoints)
-    }
+    val fallbackWireEdges: List<ScreenEdge2D> = if (!useArCore && showLiveMesh && uiState.triangleCount > 0) {
+        captureController.projectLiveMeshEdges(liveAccumulator)
+    } else emptyList()
 
     val overlayCorners: List<Pair<Float, Float>> = when {
-        !showArOverlay -> emptyList()
+        !showLiveMesh -> emptyList()
         useArCore -> arTelemetry.projectedCorners
         else -> captureController.projectCornersToScreen(uiState.cornerAnchors)
     }
@@ -347,10 +344,14 @@ fun ScannerScreen(
     val radarCamPos = if (useArCore) arTelemetry.cameraPosition else Vec3(0f, uiState.eyeHeightMeters, 0f)
 
     val topHeadline = when {
-        useArCore -> arTelemetry.trackingHeadline
-        arFallbackReason != null -> "ARCore unavailable on device • Using CameraX+IMU (drag to aim)"
-        engineMode == ScannerEngineMode.IMU_CORNER_ONLY -> "Corner Raycast Mode • Drag to aim, tap 3+ room corners"
-        else -> "CameraX + IMU Sweep • Pan room or drag viewport to aim"
+        useArCore -> {
+            if (isActivelyPainting && arTelemetry.isTracking) {
+                "PAINTING MESH • ${uiState.triangleCount} tris • Move slowly over walls & floor"
+            } else arTelemetry.trackingHeadline
+        }
+        arFallbackReason != null -> "Fallback CameraX Mesh • Drag viewport to pan, press Scan to paint"
+        engineMode == ScannerEngineMode.IMU_CORNER_ONLY -> "Corner Raycast • Drag to aim & tap 3+ room corners"
+        else -> "CameraX + IMU Mesh • Press Scan & pan room slowly"
     }
 
     DesktopWallpaperBox {
@@ -377,7 +378,7 @@ fun ScannerScreen(
                         uiState.elapsedSeconds / 60,
                         uiState.elapsedSeconds % 60
                     ),
-                    statusBarRight = "${uiState.pointCount} pts • ${uiState.coveragePercent}%",
+                    statusBarRight = "${uiState.triangleCount} tris • ${uiState.coveragePercent}%",
                     modifier = Modifier.fillMaxSize()
                 ) {
                     Column(
@@ -390,16 +391,16 @@ fun ScannerScreen(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
-                            LcdReadoutCell("POINTS", "${uiState.pointCount}", Modifier.weight(1f))
+                            LcdReadoutCell("TRIANGLES", "${uiState.triangleCount}", Modifier.weight(1f))
                             LcdReadoutCell(
                                 label = if (useArCore) "PLANES" else "CORNERS",
                                 value = if (useArCore) "${arTelemetry.detectedPlaneCount}" else "${uiState.cornerAnchors.size}",
-                                modifier = Modifier.weight(0.85f)
+                                modifier = Modifier.weight(0.8f)
                             )
                             LcdReadoutCell(
                                 label = "RANGE",
                                 value = reticleDist?.let { String.format(Locale.US, "%.2fm", it) } ?: "--",
-                                modifier = Modifier.weight(0.95f)
+                                modifier = Modifier.weight(0.9f)
                             )
                             RetroButton(
                                 onClick = { showCalibration = !showCalibration },
@@ -484,15 +485,15 @@ fun ScannerScreen(
                                         }
                                     }
 
-                                    LidarHudOverlay(
+                                    PolycamHudOverlay(
                                         yawRad = displayYawRad,
                                         cameraPos = radarCamPos,
-                                        isScanning = uiState.isScanning && !uiState.isPaused,
+                                        isScanning = isActivelyPainting,
                                         showRadar = showRadarHud,
                                         previewPoints = uiState.previewPoints,
                                         cornerAnchors = uiState.cornerAnchors,
                                         projectedPlanes = overlayPlanes,
-                                        projectedPoints = overlayPoints,
+                                        fallbackWireEdges = fallbackWireEdges,
                                         projectedCorners = overlayCorners,
                                         reticleDistMeters = reticleDist,
                                         reticleSource = reticleSrc,
@@ -515,18 +516,32 @@ fun ScannerScreen(
                                         modifier = Modifier.fillMaxSize()
                                     )
 
-                                    // Top live tracking & range status banner
-                                    Box(
+                                    // Top unmistakable status banner with live recording LED
+                                    Row(
                                         modifier = Modifier
                                             .align(Alignment.TopCenter)
                                             .padding(6.dp)
-                                            .background(Color(0xD8060C14))
-                                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                                            .background(Color(0xDC060C14))
+                                            .padding(horizontal = 10.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(8.dp)
+                                                .clip(CircleShape)
+                                                .background(
+                                                    when {
+                                                        isActivelyPainting -> Color(0xFF00E5A0)
+                                                        useArCore && arTelemetry.isTracking -> Color(0xFF38BDF8)
+                                                        else -> Color(0xFFFFB703)
+                                                    }
+                                                )
+                                        )
                                         Text(
                                             text = topHeadline,
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = if (useArCore && arTelemetry.isTracking) extras.laserBeamColor else Color(0xFFFFD166),
+                                            color = Color.White,
                                             textAlign = TextAlign.Center
                                         )
                                     }
@@ -535,8 +550,8 @@ fun ScannerScreen(
                                         Box(
                                             modifier = Modifier
                                                 .align(Alignment.Center)
-                                                .padding(top = 74.dp)
-                                                .background(Color(0xC8060C14))
+                                                .padding(top = 68.dp)
+                                                .background(Color(0xCC060C14))
                                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                                         ) {
                                             Text(
@@ -576,24 +591,23 @@ fun ScannerScreen(
                                 Text("Corner", style = MaterialTheme.typography.labelLarge)
                             }
 
-                            val active = uiState.isScanning && !uiState.isPaused
                             RetroButton(
                                 onClick = onToggleScan,
                                 enabled = !uiState.isProcessing,
                                 accent = true,
-                                active = active,
+                                active = isActivelyPainting,
                                 minHeight = 48.dp,
                                 modifier = Modifier
-                                    .weight(1.2f)
+                                    .weight(1.25f)
                                     .testTag("scanner_toggle_capture_button")
                             ) {
                                 Icon(
-                                    imageVector = if (active) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                    imageVector = if (isActivelyPainting) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                                     contentDescription = stringResource(R.string.cd_toggle_scan),
                                     modifier = Modifier.size(18.dp)
                                 )
                                 Spacer(Modifier.width(4.dp))
-                                Text(if (active) "Pause" else "Scan", style = MaterialTheme.typography.labelLarge)
+                                Text(if (isActivelyPainting) "Pause" else "Scan", style = MaterialTheme.typography.labelLarge)
                             }
 
                             RetroButton(
@@ -611,7 +625,7 @@ fun ScannerScreen(
                                     Icon(Icons.Filled.Check, contentDescription = stringResource(R.string.action_finish_scan), modifier = Modifier.size(17.dp))
                                 }
                                 Spacer(Modifier.width(4.dp))
-                                Text("Mesh", style = MaterialTheme.typography.labelLarge)
+                                Text("Done", style = MaterialTheme.typography.labelLarge)
                             }
                         }
                     }
@@ -668,7 +682,6 @@ private fun ArCoreCameraSurface(
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        // Ensure immediate resume when entering composable while already RESUMED
         if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
             renderer.resumeSession()
         }
@@ -738,10 +751,10 @@ private fun CalibrationPanel(
                 testTagName = "scanner_engine_dropdown"
             )
             RetroComboBox(
-                label = "Capture Density Preset",
-                selectedText = "${density.label} (${density.defaultVoxelCm} cm voxel)",
+                label = "Capture Detail Preset",
+                selectedText = density.label,
                 options = CaptureDensity.entries,
-                optionLabel = { "${it.label} (${it.defaultVoxelCm} cm voxel)" },
+                optionLabel = { it.label },
                 isSelected = { it == density },
                 onSelect = onDensityChange,
                 testTagName = "scanner_density_dropdown"
@@ -761,7 +774,7 @@ private fun CalibrationPanel(
 }
 
 @Composable
-private fun LidarHudOverlay(
+private fun PolycamHudOverlay(
     yawRad: Float,
     cameraPos: Vec3,
     isScanning: Boolean,
@@ -769,7 +782,7 @@ private fun LidarHudOverlay(
     previewPoints: List<SpatialPoint>,
     cornerAnchors: List<Vec3>,
     projectedPlanes: List<ScreenPlaneOverlay>,
-    projectedPoints: List<ScreenPoint2D>,
+    fallbackWireEdges: List<ScreenEdge2D>,
     projectedCorners: List<Pair<Float, Float>>,
     reticleDistMeters: Float?,
     reticleSource: String,
@@ -778,13 +791,6 @@ private fun LidarHudOverlay(
     modifier: Modifier = Modifier
 ) {
     val extras = LocalStudioSkinExtras.current
-    val infinite = rememberInfiniteTransition(label = "hud_laser")
-    val laserPos by infinite.animateFloat(
-        initialValue = 0.12f,
-        targetValue = 0.88f,
-        animationSpec = infiniteRepeatable(animation = tween(1800, easing = LinearEasing), repeatMode = RepeatMode.Reverse),
-        label = "laser_y"
-    )
 
     Canvas(
         modifier = modifier
@@ -805,7 +811,7 @@ private fun LidarHudOverlay(
         val cx = w * 0.5f
         val cy = h * 0.5f
 
-        // 1. Live ARCore Detected 3D Surface Planes (Floor / Wall / Ceiling wireframes)
+        // 1. Subtle outlines for ARCore detected architectural planes (actual dense mesh is drawn in 60fps OpenGL!)
         for (plane in projectedPlanes) {
             if (plane.points.size < 3) continue
             val path = Path().apply {
@@ -822,24 +828,21 @@ private fun LidarHudOverlay(
                 SpatialPoint.SURFACE_CEILING -> Color(0xFF60A5FA)
                 else -> Color(0xFF38BDF8)
             }
-            drawPath(path = path, color = planeColor.copy(alpha = 0.16f), style = Fill)
-            drawPath(path = path, color = planeColor.copy(alpha = 0.72f), style = Stroke(width = 1.6.dp.toPx()))
+            drawPath(path = path, color = planeColor.copy(alpha = 0.08f), style = Fill)
+            drawPath(path = path, color = planeColor.copy(alpha = 0.52f), style = Stroke(width = 1.4.dp.toPx()))
         }
 
-        // 2. Live 3D-Projected Captured Spatial Points directly on room surfaces
-        for (pt in projectedPoints) {
-            val sx = pt.nx * w
-            val sy = pt.ny * h
-            val dotColor = when (pt.surfaceType) {
-                SpatialPoint.SURFACE_FLOOR -> Color(0xFF00E5A0)
-                SpatialPoint.SURFACE_OBJECT -> Color(0xFFFFB703)
-                SpatialPoint.SURFACE_CEILING -> Color(0xFF7DD3FC)
-                else -> extras.laserBeamColor
-            }
-            drawCircle(color = dotColor.copy(alpha = 0.85f), radius = 3.2f, center = Offset(sx, sy))
+        // 2. Fallback live 3D wireframe mesh edges (when running without ARCore OpenGL renderer)
+        for (edge in fallbackWireEdges) {
+            drawLine(
+                color = extras.laserBeamColor.copy(alpha = 0.65f),
+                start = Offset(edge.x0 * w, edge.y0 * h),
+                end = Offset(edge.x1 * w, edge.y1 * h),
+                strokeWidth = 1.3.dp.toPx()
+            )
         }
 
-        // 3. Live 3D-Projected Anchored Room Corners & Perimeter Lines
+        // 3. Projected 3D anchored room corners
         if (projectedCorners.isNotEmpty()) {
             for (i in projectedCorners.indices) {
                 val a = Offset(projectedCorners[i].first * w, projectedCorners[i].second * h)
@@ -857,26 +860,11 @@ private fun LidarHudOverlay(
             }
         }
 
-        // 4. Active Laser Sweep Indicator
-        if (isScanning) {
-            val ly = h * laserPos
-            drawRect(
-                brush = Brush.verticalGradient(
-                    colors = listOf(Color.Transparent, extras.laserBeamColor.copy(alpha = 0.14f), Color.Transparent),
-                    startY = ly - 38.dp.toPx(),
-                    endY = ly + 38.dp.toPx()
-                ),
-                topLeft = Offset(0f, ly - 38.dp.toPx()),
-                size = androidx.compose.ui.geometry.Size(w, 76.dp.toPx())
-            )
-            drawLine(extras.laserBeamColor.copy(alpha = 0.82f), Offset(0f, ly), Offset(w, ly), strokeWidth = 1.8.dp.toPx())
-        }
-
-        // 5. Top-Down Mini-Radar (centered around live 6-DoF camera position!)
+        // 4. Top-Down Mini-Radar centered on camera's real 6-DoF position
         if (showRadar) {
-            val radarR = 46.dp.toPx()
-            val rx = radarR + 12.dp.toPx()
-            val ry = h - radarR - 12.dp.toPx()
+            val radarR = 44.dp.toPx()
+            val rx = radarR + 10.dp.toPx()
+            val ry = h - radarR - 10.dp.toPx()
 
             drawCircle(color = Color(0xCC060C14), radius = radarR, center = Offset(rx, ry))
             drawCircle(color = extras.laserBeamColor.copy(alpha = 0.55f), radius = radarR, center = Offset(rx, ry), style = Stroke(1.5.dp.toPx()))
@@ -887,7 +875,7 @@ private fun LidarHudOverlay(
                 val px = rx + (p.x - cameraPos.x) * radarScale
                 val py = ry + (p.z - cameraPos.z) * radarScale
                 if ((px - rx) * (px - rx) + (py - ry) * (py - ry) <= radarR * radarR) {
-                    drawCircle(color = extras.laserBeamColor.copy(alpha = 0.8f), radius = 2.1f, center = Offset(px, py))
+                    drawCircle(color = extras.laserBeamColor.copy(alpha = 0.82f), radius = 2.0f, center = Offset(px, py))
                 }
             }
             if (cornerAnchors.isNotEmpty()) {
@@ -906,36 +894,26 @@ private fun LidarHudOverlay(
                     }
                     drawCircle(color = extras.cropCageColor, radius = 4f, center = Offset(ax, ay))
                 }
-                if (cornerAnchors.size >= 3) {
-                    val first = cornerAnchors.first()
-                    val last = cornerAnchors.last()
-                    drawLine(
-                        extras.cropCageColor.copy(alpha = 0.6f),
-                        Offset(rx + (last.x - cameraPos.x) * radarScale, ry + (last.z - cameraPos.z) * radarScale),
-                        Offset(rx + (first.x - cameraPos.x) * radarScale, ry + (first.z - cameraPos.z) * radarScale),
-                        strokeWidth = 1.5.dp.toPx()
-                    )
-                }
             }
             val headX = rx + sin(yawRad) * (radarR * 0.78f)
             val headY = ry - cos(yawRad) * (radarR * 0.78f)
             drawLine(color = Color.White, start = Offset(rx, ry), end = Offset(headX, headY), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
         }
 
-        // 6. Center Rangefinder Reticle
-        val retR = 24.dp.toPx()
+        // 5. Crisp Rangefinder Reticle (clean without distracting fake green scan bar)
+        val retR = 20.dp.toPx()
         val retColor = when {
-            reticleDistMeters != null && isScanning -> extras.laserBeamColor
-            reticleSource == "DEPTH" -> Color(0xFF00E5A0)
-            else -> Color.White.copy(alpha = 0.9f)
+            isScanning && reticleDistMeters != null -> Color(0xFF00E5A0)
+            reticleSource == "DEPTH" -> extras.laserBeamColor
+            else -> Color.White.copy(alpha = 0.85f)
         }
-        drawCircle(color = retColor.copy(alpha = 0.45f), radius = retR, center = Offset(cx, cy), style = Stroke(1.5.dp.toPx()))
-        val tick = 9.dp.toPx()
-        drawLine(retColor, Offset(cx - retR - tick, cy), Offset(cx - retR + 3.dp.toPx(), cy), strokeWidth = 2.dp.toPx())
-        drawLine(retColor, Offset(cx + retR - 3.dp.toPx(), cy), Offset(cx + retR + tick, cy), strokeWidth = 2.dp.toPx())
-        drawLine(retColor, Offset(cx, cy - retR - tick), Offset(cx, cy - retR + 3.dp.toPx()), strokeWidth = 2.dp.toPx())
-        drawLine(retColor, Offset(cx, cy + retR - 3.dp.toPx()), Offset(cx, cy + retR + tick), strokeWidth = 2.dp.toPx())
-        drawCircle(color = extras.cropCageColor, radius = 3.5.dp.toPx(), center = Offset(cx, cy))
+        drawCircle(color = retColor.copy(alpha = 0.55f), radius = retR, center = Offset(cx, cy), style = Stroke(1.5.dp.toPx()))
+        val tick = 7.dp.toPx()
+        drawLine(retColor, Offset(cx - retR - tick, cy), Offset(cx - retR + 3.dp.toPx(), cy), strokeWidth = 1.8.dp.toPx())
+        drawLine(retColor, Offset(cx + retR - 3.dp.toPx(), cy), Offset(cx + retR + tick, cy), strokeWidth = 1.8.dp.toPx())
+        drawLine(retColor, Offset(cx, cy - retR - tick), Offset(cx, cy - retR + 3.dp.toPx()), strokeWidth = 1.8.dp.toPx())
+        drawLine(retColor, Offset(cx, cy + retR - 3.dp.toPx()), Offset(cx, cy + retR + tick), strokeWidth = 1.8.dp.toPx())
+        drawCircle(color = extras.cropCageColor, radius = 3.dp.toPx(), center = Offset(cx, cy))
     }
 }
 

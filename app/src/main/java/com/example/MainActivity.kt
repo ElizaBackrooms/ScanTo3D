@@ -90,6 +90,7 @@ fun LidarForgeApp(container: AppContainer) {
                 val uiState by vm.uiState.collectAsStateWithLifecycle()
                 ScannerScreen(
                     uiState = uiState,
+                    liveAccumulator = vm.liveMeshAccumulator,
                     sensorReadiness = container.sensorReadiness,
                     currentSkin = settings.themeSkin,
                     currentUnit = settings.measurementUnit,
@@ -97,9 +98,10 @@ fun LidarForgeApp(container: AppContainer) {
                     onSelectUnit = selectUnit,
                     onBack = { navController.popBackStack() },
                     onToggleScan = vm::startOrToggleScan,
-                    onPointsCaptured = vm::ingestCapturedPoints,
+                    onPatchCaptured = vm::ingestMeshPatch,
                     onAnchorCorner = vm::anchorCorner,
                     onUndo = vm::undoLastCapture,
+                    onClearScan = vm::clearScan,
                     onEyeHeightChange = vm::setEyeHeight,
                     onCeilingHeightChange = vm::setCeilingHeight,
                     onDensityChange = vm::setCaptureDensity,

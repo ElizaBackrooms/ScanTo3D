@@ -41,20 +41,22 @@ class ScanRepository(
         title: String,
         sensorMode: String,
         rawPoints: List<SpatialPoint>,
+        capturedTriangles: IntArray = IntArray(0),
         cornerAnchors: List<Vec3>,
         ceilingHeightMeters: Float,
         voxelSizeCm: Int = 10
     ): Long = withContext(Dispatchers.Default) {
         val fileName = "scan_${UUID.randomUUID().toString().take(8)}.lfg"
         val file = File(scansDir, fileName)
-        SpatialMeshProcessor.writeScanBinary(file, rawPoints, cornerAnchors, ceilingHeightMeters)
+        SpatialMeshProcessor.writeScanBinary(file, rawPoints, cornerAnchors, ceilingHeightMeters, capturedTriangles)
 
         val mesh = SpatialMeshProcessor.buildMesh(
             rawPoints = rawPoints,
             cornerAnchors = cornerAnchors,
             ceilingHeightMeters = ceilingHeightMeters,
             voxelSizeCm = voxelSizeCm,
-            smoothSurface = true
+            smoothSurface = true,
+            capturedTriangles = capturedTriangles
         )
 
         val entity = RoomScanEntity(

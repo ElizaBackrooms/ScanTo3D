@@ -108,7 +108,8 @@ class StudioViewModel(
                     ceilingHeightMeters = pkg.ceilingHeightMeters,
                     voxelSizeCm = entity.voxelSizeCm,
                     smoothSurface = entity.smoothSurface,
-                    cropBounds = CropBounds()
+                    cropBounds = CropBounds(),
+                    capturedTriangles = pkg.capturedTriangles
                 )
             }
             val crop = entity.parsedCropBounds()
@@ -233,7 +234,8 @@ class StudioViewModel(
                     ceilingHeightMeters = pkg.ceilingHeightMeters,
                     voxelSizeCm = clamped,
                     smoothSurface = smoothSurface,
-                    cropBounds = CropBounds()
+                    cropBounds = CropBounds(),
+                    capturedTriangles = pkg.capturedTriangles
                 )
                 val active = SpatialMeshProcessor.applyCrop(full, _uiState.value.cropBounds)
                 full to (if (active.vertexCount > 0) active else full)

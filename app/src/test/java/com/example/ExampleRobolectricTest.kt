@@ -104,4 +104,63 @@ class ExampleRobolectricTest {
         val stlBytes = stlOut.toByteArray()
         assertEquals(84 + pkg.mesh.triangleCount * 50, stlBytes.size)
     }
+
+    @Test
+    fun liveMeshAccumulatorWeldsConnectedSurfacesAndPersistsLfg2() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val accumulator = com.example.scanner.LiveMeshAccumulator(weldVoxelMeters = 0.05f)
+
+        // Simulate a 4x4 connected wall depth patch (9 quads = 18 triangles)
+        val verts = ArrayList<SpatialPoint>()
+        for (r in 0 until 4) {
+            for (c in 0 until 4) {
+                verts.add(
+                    SpatialPoint(
+                        x = c * 0.20f,
+                        y = r * 0.20f,
+                        z = -2.0f,
+                        argb = Color.rgb(180 + c * 10, 170 + r * 10, 160),
+                        surfaceType = SpatialPoint.SURFACE_WALL
+                    )
+                )
+            }
+        }
+        val tris = ArrayList<Int>()
+        for (r in 0 until 3) {
+            for (c in 0 until 3) {
+                val i00 = r * 4 + c
+                val i10 = r * 4 + (c + 1)
+                val i11 = (r + 1) * 4 + (c + 1)
+                val i01 = (r + 1) * 4 + c
+                tris.add(i00); tris.add(i11); tris.add(i10)
+                tris.add(i00); tris.add(i01); tris.add(i11)
+            }
+        }
+
+        val stats = accumulator.ingestPatch(com.example.scanner.CapturedMeshPatch(verts, tris.toIntArray()))
+        assertEquals(16, stats.vertexCount)
+        assertEquals(18, stats.triangleCount)
+
+        // Second overlapping pass over same wall should weld/refine, NOT duplicate triangles
+        val stats2 = accumulator.ingestPatch(com.example.scanner.CapturedMeshPatch(verts, tris.toIntArray()))
+        assertEquals(16, stats2.vertexCount)
+        assertEquals(18, stats2.triangleCount)
+
+        // GL snapshot for 60fps OpenGL live mesh painting must have matching triangles & edges
+        val glSnap = accumulator.snapshotForGl()
+        assertEquals(16, glSnap.vertexCount)
+        assertEquals(18, glSnap.triangleCount)
+        assertTrue(glSnap.edgeIndices.size >= 30)
+
+        // LFG2 binary round-trip preserves real surface triangles into Studio & exports
+        val (pts, capturedTris) = accumulator.exportPointsAndTriangles()
+        val tmp = File(context.cacheDir, "test_polycam_wall.lfg")
+        SpatialMeshProcessor.writeScanBinary(tmp, pts, emptyList(), 2.6f, capturedTris)
+        val loaded = SpatialMeshProcessor.readScanBinary(tmp, voxelSizeCm = 6, smoothSurface = true)
+        tmp.delete()
+
+        assertEquals(18, loaded.capturedTriangles.size / 3)
+        assertEquals(16, loaded.mesh.vertexCount)
+        assertEquals(18, loaded.mesh.triangleCount)
+    }
 }

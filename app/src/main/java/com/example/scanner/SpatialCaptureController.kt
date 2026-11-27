@@ -29,7 +29,6 @@ data class ImuPose(
     val yawDegrees: Float get() = ((yawRad * 180f / PI.toFloat()) % 360f + 360f) % 360f
     val pitchDegrees: Float get() = pitchRad * 180f / PI.toFloat()
 
-    /** Unit forward vector in Y-Up world coordinates */
     fun forwardVector(): Vec3 {
         val cp = cos(pitchRad)
         return Vec3(
@@ -39,20 +38,17 @@ data class ImuPose(
         ).normalize()
     }
 
-    /** Unit right vector on horizontal plane */
     fun rightVector(): Vec3 = Vec3(cos(yawRad), 0f, sin(yawRad)).normalize()
 }
 
 /**
- * Fallback spatial capture controller for devices without ARCore (or when CameraX+IMU mode is chosen).
- * Combines:
- * 1. Android SensorManager orientation + additive manual touch-steering (always responsive on emulators).
- * 2. Live CameraX YUV ImageAnalysis with motion-gated capture (prevents duplicate stationary flooding).
- * 3. Wall-polygon & floor/ceiling plane ray intersection so anchored corners sculpt crisp room geometry.
+ * Fallback spatial capture controller for devices without ARCore (or emulators).
+ * Emits connected 3D surface triangle patches (not isolated confetti points!) and projects
+ * the live growing 3D wireframe mesh directly over the CameraX preview.
  */
 class SpatialCaptureController(
     context: Context,
-    private val onPointsCaptured: (List<SpatialPoint>) -> Unit
+    private val onPatchCaptured: (CapturedMeshPatch) -> Unit
 ) : SensorEventListener {
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
@@ -102,7 +98,6 @@ class SpatialCaptureController(
         sensorManager?.unregisterListener(this)
     }
 
-    /** Always allows touch-dragging the camera aim (additive on top of IMU, ideal on emulators). */
     fun nudgeManualPose(deltaYawRad: Float, deltaPitchRad: Float) {
         manualYawOffset += deltaYawRad
         manualPitchOffset = (manualPitchOffset + deltaPitchRad).coerceIn(-1.15f, 1.15f)
@@ -151,10 +146,8 @@ class SpatialCaptureController(
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
-    /** Raycasts the center reticle onto y = 0 floor plane. */
     fun raycastFloorCorner(): Vec3 = raycastFloorCornerAt(0.5f, 0.5f)
 
-    /** Raycasts any normalized (0..1, 0..1) tap coordinate onto y = 0 floor plane. */
     fun raycastFloorCornerAt(normX: Float, normY: Float): Vec3 {
         val pose = _imuPose.value
         val fwd = pose.forwardVector()
@@ -164,38 +157,60 @@ class SpatialCaptureController(
         val ndcY = (0.5f - normY) * 2f
         val ray = (fwd + right * (ndcX * tanHalfFovH) + up * (ndcY * tanHalfFovV)).normalize()
 
-        val downSlope = (-ray.y).coerceIn(0.18f, 1.25f)
-        val dist = (eyeHeightMeters / downSlope).coerceIn(0.75f, 7.5f)
+        val downSlope = (-ray.y).coerceIn(0.18f, 0.95f)
         val horizLen = sqrt(ray.x * ray.x + ray.z * ray.z).coerceAtLeast(0.01f)
-        val horizDist = (eyeHeightMeters / tan(kotlin.math.asin(downSlope.coerceIn(0.18f, 0.95f)))).coerceIn(0.75f, 7.5f)
+        val horizDist = (eyeHeightMeters / tan(kotlin.math.asin(downSlope))).coerceIn(0.75f, 7.5f)
         return Vec3((ray.x / horizLen) * horizDist, 0f, (ray.z / horizLen) * horizDist)
     }
 
-    /** Estimates range at center reticle for live HUD readout. */
     fun estimateReticleDistance(): Float {
         val pose = _imuPose.value
-        val fwd = pose.forwardVector()
-        return intersectRoomPlanes(fwd, eyeHeightMeters, ceilingHeightMeters, roomCorners).first
+        return intersectRoomPlanes(pose.forwardVector(), eyeHeightMeters, ceilingHeightMeters, roomCorners).first
     }
 
-    /** Projects world points into normalized (0..1) screen space for live fallback AR HUD overlay. */
-    fun projectPointsToScreen(points: List<SpatialPoint>): List<ScreenPoint2D> {
-        if (points.isEmpty()) return emptyList()
+    /** Projects live captured wireframe mesh edges onto screen for fallback Polycam HUD. */
+    fun projectLiveMeshEdges(accumulator: LiveMeshAccumulator): List<ScreenEdge2D> {
+        val snap = accumulator.snapshotForGl()
+        if (snap.edgeIndices.isEmpty() || snap.vertexCount == 0) return emptyList()
+
         val pose = _imuPose.value
         val fwd = pose.forwardVector()
         val right = pose.rightVector()
         val up = right.cross(fwd).normalize()
         val eye = Vec3(0f, eyeHeightMeters, 0f)
-        val out = ArrayList<ScreenPoint2D>(points.size.coerceAtMost(220))
-        for (p in points) {
-            val rel = Vec3(p.x - eye.x, p.y - eye.y, p.z - eye.z)
-            val depth = rel.dot(fwd)
+
+        val projX = FloatArray(snap.vertexCount)
+        val projY = FloatArray(snap.vertexCount)
+        val vis = BooleanArray(snap.vertexCount)
+        for (i in 0 until snap.vertexCount) {
+            val b = i * 3
+            val rx = snap.vertices[b] - eye.x
+            val ry = snap.vertices[b + 1] - eye.y
+            val rz = snap.vertices[b + 2] - eye.z
+            val depth = rx * fwd.x + ry * fwd.y + rz * fwd.z
             if (depth <= 0.15f) continue
-            val ndcX = rel.dot(right) / (depth * tanHalfFovH)
-            val ndcY = rel.dot(up) / (depth * tanHalfFovV)
-            if (ndcX in -1.05f..1.05f && ndcY in -1.05f..1.05f) {
-                out.add(ScreenPoint2D((ndcX + 1f) * 0.5f, (1f - ndcY) * 0.5f, p.argb, p.surfaceType))
+            val ndcX = (rx * right.x + ry * right.y + rz * right.z) / (depth * tanHalfFovH)
+            val ndcY = (rx * up.x + ry * up.y + rz * up.z) / (depth * tanHalfFovV)
+            projX[i] = (ndcX + 1f) * 0.5f
+            projY[i] = (1f - ndcY) * 0.5f
+            vis[i] = true
+        }
+
+        val edgeCount = snap.edgeIndices.size / 2
+        val stride = (edgeCount / 900).coerceAtLeast(1)
+        val out = ArrayList<ScreenEdge2D>(minOf(edgeCount, 900))
+        var e = 0
+        while (e < edgeCount) {
+            val a = snap.edgeIndices[e * 2]
+            val b = snap.edgeIndices[e * 2 + 1]
+            if (a < snap.vertexCount && b < snap.vertexCount && vis[a] && vis[b]) {
+                val x0 = projX[a]; val y0 = projY[a]
+                val x1 = projX[b]; val y1 = projY[b]
+                if ((x0 in -0.1f..1.1f && y0 in -0.1f..1.1f) || (x1 in -0.1f..1.1f && y1 in -0.1f..1.1f)) {
+                    out.add(ScreenEdge2D(x0, y0, x1, y1))
+                }
             }
+            e += stride
         }
         return out
     }
@@ -221,7 +236,7 @@ class SpatialCaptureController(
         try {
             if (!isActivelyCapturing) return@Analyzer
             val now = System.currentTimeMillis()
-            if (now - lastFrameTimeMs < 150L) return@Analyzer
+            if (now - lastFrameTimeMs < 160L) return@Analyzer
 
             val pose = _imuPose.value
             val angularDelta = if (lastCapturedYaw == Float.MAX_VALUE) {
@@ -230,7 +245,6 @@ class SpatialCaptureController(
                 abs(pose.yawRad - lastCapturedYaw) + abs(pose.pitchRad - lastCapturedPitch)
             }
 
-            // Avoid spamming thousands of duplicate points when device is completely motionless
             if (angularDelta < 0.025f && now - lastFrameTimeMs < 750L) {
                 return@Analyzer
             }
@@ -239,23 +253,25 @@ class SpatialCaptureController(
             lastCapturedYaw = pose.yawRad
             lastCapturedPitch = pose.pitchRad
 
-            val points = extractPointsFromFrame(image, pose, angularDelta)
-            if (points.isNotEmpty()) {
-                onPointsCaptured(points)
+            val patch = extractConnectedPatchFromFrame(image, pose, angularDelta)
+            if (patch.vertices.isNotEmpty()) {
+                onPatchCaptured(patch)
             }
         } finally {
             image.close()
         }
     }
 
-    private fun extractPointsFromFrame(
+    private fun extractConnectedPatchFromFrame(
         image: ImageProxy,
         pose: ImuPose,
         angularSpeed: Float
-    ): List<SpatialPoint> {
+    ): CapturedMeshPatch {
         val width = image.width
         val height = image.height
-        if (width < 32 || height < 32 || image.planes.isEmpty()) return emptyList()
+        if (width < 32 || height < 32 || image.planes.isEmpty()) {
+            return CapturedMeshPatch(emptyList(), IntArray(0))
+        }
 
         val yPlane = image.planes[0]
         val yBuf = yPlane.buffer
@@ -268,8 +284,8 @@ class SpatialCaptureController(
         val uBuf = uPlane?.buffer
         val vBuf = vPlane?.buffer
 
-        val cols = sampleStep.coerceIn(8, 20)
-        val rows = (cols * 3 / 4).coerceIn(6, 15)
+        val cols = sampleStep.coerceIn(10, 18)
+        val rows = (cols * 3 / 4).coerceIn(8, 14)
         val signature = FloatArray(cols * rows)
 
         val fwd = pose.forwardVector()
@@ -277,14 +293,15 @@ class SpatialCaptureController(
         val up = right.cross(fwd).normalize()
 
         val cornersSnapshot = roomCorners
-        val out = ArrayList<SpatialPoint>(cols * rows)
+        val verts = ArrayList<SpatialPoint>(cols * rows)
+        val gridIdx = IntArray(cols * rows) { -1 }
         val prevMatches = prevLumaSignature.size == signature.size
 
         for (r in 0 until rows) {
-            val ny = (r + 0.5f) / rows
+            val ny = 0.06f + 0.88f * (r.toFloat() / (rows - 1).coerceAtLeast(1))
             val py = (ny * (height - 2)).toInt().coerceIn(1, height - 2)
             for (c in 0 until cols) {
-                val nx = (c + 0.5f) / cols
+                val nx = 0.06f + 0.88f * (c.toFloat() / (cols - 1).coerceAtLeast(1))
                 val px = (nx * (width - 2)).toInt().coerceIn(1, width - 2)
 
                 val lumaIdx = py * yRowStride + px * yPixStride
@@ -297,50 +314,57 @@ class SpatialCaptureController(
                 val sigIdx = r * cols + c
                 val lumaNorm = yVal / 255f
                 signature[sigIdx] = lumaNorm
-                val temporalDelta = if (prevMatches) abs(lumaNorm - prevLumaSignature[sigIdx]) else 0.04f
+                val temporalDelta = if (prevMatches) abs(lumaNorm - prevLumaSignature[sigIdx]) else 0.03f
 
                 val ndcX = (nx - 0.5f) * 2f
                 val ndcY = (0.5f - ny) * 2f
                 val ray = (fwd + right * (ndcX * tanHalfFovH) + up * (ndcY * tanHalfFovV)).normalize()
 
-                val (baseDist, baseSurface) = intersectRoomPlanes(
-                    ray = ray,
-                    eyeHeight = eyeHeightMeters,
-                    ceilingHeight = ceilingHeightMeters,
-                    corners = cornersSnapshot
-                )
-
-                // Modulate non-floor/ceiling hits slightly with local structural edges for relief
+                val (baseDist, baseSurface) = intersectRoomPlanes(ray, eyeHeightMeters, ceilingHeightMeters, cornersSnapshot)
                 val depth = if (baseSurface == SpatialPoint.SURFACE_WALL) {
-                    val relief = (gradient * 0.25f + (if (angularSpeed > 0.02f) (temporalDelta * 0.25f) else 0f)).coerceIn(0f, 0.45f)
+                    val relief = (gradient * 0.16f + (if (angularSpeed > 0.02f) temporalDelta * 0.15f else 0f)).coerceIn(0f, 0.25f)
                     (baseDist - relief).coerceIn(0.65f, 6.5f)
-                } else {
-                    baseDist
-                }
-                val finalSurface = if (baseSurface == SpatialPoint.SURFACE_WALL && gradient > 0.18f) {
-                    SpatialPoint.SURFACE_OBJECT
-                } else {
-                    baseSurface
-                }
+                } else baseDist
 
                 val wx = ray.x * depth
-                val wy = (eyeHeightMeters + ray.y * depth).coerceIn(0f, ceilingHeightMeters + 0.15f)
+                val wy = (eyeHeightMeters + ray.y * depth).coerceIn(0f, ceilingHeightMeters + 0.10f)
                 val wz = ray.z * depth
-
                 val argb = sampleRgbColor(yVal, px, py, uPlane, vPlane, uBuf, vBuf)
-                out.add(SpatialPoint(wx, wy, wz, argb, finalSurface))
+
+                gridIdx[r * cols + c] = verts.size
+                verts.add(SpatialPoint(wx, wy, wz, argb, baseSurface))
             }
         }
         prevLumaSignature = signature
-        return out
+
+        // Connect adjacent grid vertices into clean continuous room surface triangles
+        val tris = ArrayList<Int>(cols * rows * 6)
+        val maxEdgeSq = 0.72f * 0.72f
+        fun close(a: Int, b: Int): Boolean {
+            if (a < 0 || b < 0) return false
+            val pa = verts[a]; val pb = verts[b]
+            val dx = pa.x - pb.x; val dy = pa.y - pb.y; val dz = pa.z - pb.z
+            return dx * dx + dy * dy + dz * dz <= maxEdgeSq
+        }
+
+        for (r in 0 until rows - 1) {
+            for (c in 0 until cols - 1) {
+                val i00 = gridIdx[r * cols + c]
+                val i10 = gridIdx[r * cols + (c + 1)]
+                val i11 = gridIdx[(r + 1) * cols + (c + 1)]
+                val i01 = gridIdx[(r + 1) * cols + c]
+                if (close(i00, i10) && close(i10, i11) && close(i11, i00)) {
+                    tris.add(i00); tris.add(i11); tris.add(i10)
+                }
+                if (close(i00, i11) && close(i11, i01) && close(i01, i00)) {
+                    tris.add(i00); tris.add(i01); tris.add(i11)
+                }
+            }
+        }
+
+        return CapturedMeshPatch(verts, tris.toIntArray())
     }
 
-    /**
-     * Intersects a world-space camera ray with:
-     * 1. Floor plane (y = 0)
-     * 2. Ceiling plane (y = ceilingHeight)
-     * 3. Any anchored room wall segments (if >= 3 corners anchored) OR a crisp rectangular room fallback
-     */
     private fun intersectRoomPlanes(
         ray: Vec3,
         eyeHeight: Float,
@@ -373,7 +397,6 @@ class SpatialCaptureController(
             }
         }
 
-        // If no wall polygon hit, intersect an axis-aligned rectangular room box (±2.6m) rather than a round sphere
         if (wallDist == Float.MAX_VALUE) {
             val halfW = 2.6f
             val halfD = 3.0f
