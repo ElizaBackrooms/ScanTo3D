@@ -44,7 +44,7 @@ object HardwareCapabilities {
 
         val hasArCore = try {
             val availability = ArCoreApk.getInstance().checkAvailability(context)
-            availability.isSupported
+            availability.isSupported || availability.isTransient
         } catch (_: Throwable) {
             false
         }

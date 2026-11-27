@@ -8,9 +8,7 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.atan2
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
@@ -22,8 +20,9 @@ object SpatialMeshProcessor {
     private const val LFG_MAGIC = 0x4C464731 // "LFG1"
 
     /**
-     * Reconstructs a clean indexed 3D room mesh from captured spatial points and/or anchored room corners.
-     * Supports configurable voxel resolution (4 cm .. 24 cm) and optional Laplacian smoothing.
+     * Reconstructs a clean indexed 3D room mesh from real 3D ARCore depth / SLAM points
+     * and/or anchored room corners using 3D multi-axis voxel adjacency meshing (preserves
+     * flat walls, L-shaped rooms, alcoves, and interior furniture without spherical distortion).
      */
     fun buildMesh(
         rawPoints: List<SpatialPoint>,
@@ -34,13 +33,13 @@ object SpatialMeshProcessor {
         cropBounds: CropBounds = CropBounds()
     ): SpatialMesh {
         val voxelMeters = (voxelSizeCm.coerceIn(4, 28)) / 100f
-        val verts = ArrayList<Float>(4096)
-        val norms = ArrayList<Float>(4096)
-        val cols = ArrayList<Int>(2048)
-        val types = ArrayList<Byte>(2048)
-        val tris = ArrayList<Int>(8192)
+        val verts = ArrayList<Float>(8192)
+        val norms = ArrayList<Float>(8192)
+        val cols = ArrayList<Int>(4096)
+        val types = ArrayList<Byte>(4096)
+        val tris = ArrayList<Int>(16384)
 
-        // 1. Build crisp architectural floor, wall, and ceiling patches from any anchored room corners
+        // 1. Crisp architectural floor, wall, and ceiling patches from anchored room corners
         if (cornerAnchors.size >= 3) {
             appendArchitecturalShell(
                 corners = cornerAnchors,
@@ -54,9 +53,9 @@ object SpatialMeshProcessor {
             )
         }
 
-        // 2. Voxel-fuse captured camera/depth points and triangulate local surface neighborhoods
+        // 2. True 3D voxel-grid multi-axis surface meshing for captured 3D depth / SLAM points
         if (rawPoints.isNotEmpty()) {
-            appendVoxelizedPointMesh(
+            appendVoxelized3DSurfaceMesh(
                 rawPoints = rawPoints,
                 voxelMeters = voxelMeters,
                 smoothSurface = smoothSurface,
@@ -177,7 +176,6 @@ object SpatialMeshProcessor {
         floorY /= n
         val ceilY = floorY + ceilingHeight
 
-        // Floor fan subdivided concentrically for clean density & Bryce heightmap fidelity
         val floorCenterIdx = addVertex(verts, norms, cols, types, cx, floorY, cz, 0f, 1f, 0f, floorColor, SpatialPoint.SURFACE_FLOOR)
         val ringCount = 3
         val ringIndices = Array(ringCount) { IntArray(n) }
@@ -205,14 +203,12 @@ object SpatialMeshProcessor {
             }
         }
 
-        // Walls between consecutive anchored corners
         for (i in 0 until n) {
             val p0 = corners[i]
             val p1 = corners[(i + 1) % n]
             val dx = p1.x - p0.x
             val dz = p1.z - p0.z
             val wallLen = sqrt(dx * dx + dz * dz).coerceAtLeast(0.05f)
-            // Inward wall normal pointing toward room center
             var nx = -dz / wallLen
             var nz = dx / wallLen
             val midX = (p0.x + p1.x) * 0.5f
@@ -230,7 +226,6 @@ object SpatialMeshProcessor {
             for (v in 0..rowsV) {
                 val vf = v.toFloat() / rowsV
                 val wy = floorY + ceilingHeight * vf
-                // Slight vertical shading gradient for architectural legibility
                 val shade = (0.86f + 0.14f * vf)
                 val col = scaleColor(wallTint, shade)
                 for (u in 0..colsU) {
@@ -255,7 +250,6 @@ object SpatialMeshProcessor {
             }
         }
 
-        // Open-top rim strip (subtle ceiling border frame so interior stays clearly visible in 3D orbit)
         val borderInset = 0.18f
         val outerCeil = IntArray(n)
         val innerCeil = IntArray(n)
@@ -273,7 +267,11 @@ object SpatialMeshProcessor {
         }
     }
 
-    private class VoxelAccum {
+    private class VoxelNode(
+        val gx: Int,
+        val gy: Int,
+        val gz: Int
+    ) {
         var sx = 0f
         var sy = 0f
         var sz = 0f
@@ -281,10 +279,29 @@ object SpatialMeshProcessor {
         var sg = 0L
         var sb = 0L
         var count = 0
-        var surfaceType: Byte = SpatialPoint.SURFACE_WALL
+        val typeVotes = IntArray(4)
+
+        var posX = 0f
+        var posY = 0f
+        var posZ = 0f
+        var smoothX = 0f
+        var smoothY = 0f
+        var smoothZ = 0f
+        var vertexIndex = -1
+        var hasFace = false
+        var dominantType: Byte = SpatialPoint.SURFACE_WALL
+        var argb: Int = 0
     }
 
-    private fun appendVoxelizedPointMesh(
+    /**
+     * True 3D multi-axis voxel adjacency meshing:
+     * - Preserves L-shaped rooms, doorways, hallways, desks, chairs, and alcoves.
+     * - Connects adjacent 3D voxels along XZ (horizontal floors/tables/ceilings),
+     *   XY (front/back walls), and ZY (left/right walls) with strict edge-length gating
+     *   so zero spiderweb triangles ever bridge across empty room space.
+     * - Emits clean micro-surfel quads for isolated fine-detail object voxels.
+     */
+    private fun appendVoxelized3DSurfaceMesh(
         rawPoints: List<SpatialPoint>,
         voxelMeters: Float,
         smoothSurface: Boolean,
@@ -295,170 +312,195 @@ object SpatialMeshProcessor {
         tris: ArrayList<Int>
     ) {
         val invVoxel = 1f / voxelMeters
-        val voxels = LinkedHashMap<Long, VoxelAccum>(min(rawPoints.size, 8192))
+        val voxels = LinkedHashMap<Long, VoxelNode>(min(rawPoints.size, 12_000))
 
         for (p in rawPoints) {
             val gx = floor(p.x * invVoxel).toInt()
             val gy = floor(p.y * invVoxel).toInt()
             val gz = floor(p.z * invVoxel).toInt()
             val key = packGridKey(gx, gy, gz)
-            val acc = voxels.getOrPut(key) { VoxelAccum() }
-            acc.sx += p.x
-            acc.sy += p.y
-            acc.sz += p.z
-            acc.sr += AndroidColor.red(p.argb)
-            acc.sg += AndroidColor.green(p.argb)
-            acc.sb += AndroidColor.blue(p.argb)
-            acc.count++
-            acc.surfaceType = p.surfaceType
+            val node = voxels.getOrPut(key) { VoxelNode(gx, gy, gz) }
+            node.sx += p.x
+            node.sy += p.y
+            node.sz += p.z
+            node.sr += AndroidColor.red(p.argb)
+            node.sg += AndroidColor.green(p.argb)
+            node.sb += AndroidColor.blue(p.argb)
+            node.count++
+            val tIdx = p.surfaceType.toInt().coerceIn(0, 3)
+            node.typeVotes[tIdx]++
         }
 
         if (voxels.isEmpty()) return
 
-        // Compute centroid for inward room normal estimation
         var meanX = 0f
         var meanY = 0f
         var meanZ = 0f
-        val baseOffset = verts.size / 3
-        val voxelPoints = ArrayList<Vec3>(voxels.size)
-        val voxelCols = ArrayList<Int>(voxels.size)
-        val voxelTypes = ArrayList<Byte>(voxels.size)
+        for (node in voxels.values) {
+            val inv = 1f / node.count
+            node.posX = node.sx * inv
+            node.posY = node.sy * inv
+            node.posZ = node.sz * inv
+            node.smoothX = node.posX
+            node.smoothY = node.posY
+            node.smoothZ = node.posZ
+            meanX += node.posX
+            meanY += node.posY
+            meanZ += node.posZ
 
-        for (acc in voxels.values) {
-            val inv = 1f / acc.count
-            val vx = acc.sx * inv
-            val vy = acc.sy * inv
-            val vz = acc.sz * inv
-            meanX += vx
-            meanY += vy
-            meanZ += vz
-            voxelPoints.add(Vec3(vx, vy, vz))
-            voxelCols.add(
-                AndroidColor.rgb(
-                    (acc.sr / acc.count).toInt().coerceIn(0, 255),
-                    (acc.sg / acc.count).toInt().coerceIn(0, 255),
-                    (acc.sb / acc.count).toInt().coerceIn(0, 255)
-                )
-            )
-            voxelTypes.add(acc.surfaceType)
-        }
-        meanX /= voxelPoints.size
-        meanY /= voxelPoints.size
-        meanZ /= voxelPoints.size
-
-        // Bin points onto a panoramic spherical/cylindrical scan grid around centroid for clean fast triangulation
-        val azBins = (64f / (voxelMeters * 8f)).roundToInt().coerceIn(24, 96)
-        val elBins = (32f / (voxelMeters * 8f)).roundToInt().coerceIn(12, 48)
-        val gridCellIdx = IntArray(azBins * elBins) { -1 }
-        val gridCellDist = FloatArray(azBins * elBins) { Float.MAX_VALUE }
-
-        // Optional light spatial smoothing pass using cylindrical neighbors
-        val finalPos = voxelPoints.toMutableList()
-        val cellAccumPos = Array<Vec3?>(azBins * elBins) { null }
-        val cellAccumCount = IntArray(azBins * elBins)
-
-        for (i in voxelPoints.indices) {
-            val pt = voxelPoints[i]
-            val dx = pt.x - meanX
-            val dy = pt.y - meanY
-            val dz = pt.z - meanZ
-            val az = atan2(dz.toDouble(), dx.toDouble()).toFloat() // -PI..PI
-            val horiz = sqrt(dx * dx + dz * dz).coerceAtLeast(0.01f)
-            val el = atan2(dy.toDouble(), horiz.toDouble()).toFloat() // -PI/2..PI/2
-
-            val u = (((az + PI.toFloat()) / (2f * PI.toFloat())) * azBins).toInt().coerceIn(0, azBins - 1)
-            val v = (((el + (PI.toFloat() * 0.5f)) / PI.toFloat()) * elBins).toInt().coerceIn(0, elBins - 1)
-            val cell = v * azBins + u
-            val dist = sqrt(dx * dx + dy * dy + dz * dz)
-
-            cellAccumPos[cell] = (cellAccumPos[cell] ?: Vec3(0f, 0f, 0f)) + pt
-            cellAccumCount[cell]++
-
-            if (dist < gridCellDist[cell]) {
-                gridCellDist[cell] = dist
-                gridCellIdx[cell] = i
+            var bestType = 1
+            var bestVotes = -1
+            for (k in 0..3) {
+                if (node.typeVotes[k] > bestVotes) {
+                    bestVotes = node.typeVotes[k]
+                    bestType = k
+                }
             }
+            node.dominantType = bestType.toByte()
+            node.argb = AndroidColor.rgb(
+                (node.sr / node.count).toInt().coerceIn(0, 255),
+                (node.sg / node.count).toInt().coerceIn(0, 255),
+                (node.sb / node.count).toInt().coerceIn(0, 255)
+            )
         }
+        meanX /= voxels.size
+        meanY /= voxels.size
+        meanZ /= voxels.size
 
+        // Surface-aware 3D Laplacian smoothing (only blends with immediate same-type 3D neighbors)
         if (smoothSurface) {
-            for (v in 1 until elBins - 1) {
-                for (u in 0 until azBins) {
-                    val idx = gridCellIdx[v * azBins + u]
-                    if (idx < 0) continue
-                    var sx = finalPos[idx].x * 2f
-                    var sy = finalPos[idx].y * 2f
-                    var sz = finalPos[idx].z * 2f
-                    var w = 2f
-                    val neighbors = intArrayOf(
-                        v * azBins + ((u + 1) % azBins),
-                        v * azBins + ((u - 1 + azBins) % azBins),
-                        (v + 1) * azBins + u,
-                        (v - 1) * azBins + u
-                    )
-                    for (nc in neighbors) {
-                        val ni = gridCellIdx[nc]
-                        if (ni >= 0) {
-                            val np = voxelPoints[ni]
-                            if (np.distanceTo(voxelPoints[idx]) < voxelMeters * 4.5f) {
-                                sx += np.x
-                                sy += np.y
-                                sz += np.z
+            for (node in voxels.values) {
+                var ax = node.posX * 2.5f
+                var ay = node.posY * 2.5f
+                var az = node.posZ * 2.5f
+                var w = 2.5f
+                for (dx in -1..1) {
+                    for (dy in -1..1) {
+                        for (dz in -1..1) {
+                            if (dx == 0 && dy == 0 && dz == 0) continue
+                            val nb = voxels[packGridKey(node.gx + dx, node.gy + dy, node.gz + dz)] ?: continue
+                            if (nb.dominantType == node.dominantType) {
+                                ax += nb.posX
+                                ay += nb.posY
+                                az += nb.posZ
                                 w += 1f
                             }
                         }
                     }
-                    finalPos[idx] = Vec3(sx / w, sy / w, sz / w)
                 }
+                node.smoothX = ax / w
+                node.smoothY = ay / w
+                node.smoothZ = az / w
             }
         }
 
-        // Emit vertices
-        for (i in finalPos.indices) {
-            val pt = finalPos[i]
-            val toCenter = Vec3(meanX - pt.x, meanY - pt.y, meanZ - pt.z).normalize()
-            addVertex(
+        // Emit one vertex per occupied 3D voxel
+        val baseOffset = verts.size / 3
+        for (node in voxels.values) {
+            val initNormal = when (node.dominantType) {
+                SpatialPoint.SURFACE_FLOOR -> Vec3(0f, 1f, 0f)
+                SpatialPoint.SURFACE_CEILING -> Vec3(0f, -1f, 0f)
+                else -> Vec3(meanX - node.smoothX, meanY - node.smoothY, meanZ - node.smoothZ).normalize()
+            }
+            node.vertexIndex = addVertex(
                 verts, norms, cols, types,
-                pt.x, pt.y, pt.z,
-                toCenter.x, toCenter.y, toCenter.z,
-                voxelCols[i],
-                voxelTypes[i]
+                node.smoothX, node.smoothY, node.smoothZ,
+                initNormal.x, initNormal.y, initNormal.z,
+                node.argb,
+                node.dominantType
             )
         }
 
-        // Connect adjacent occupied panoramic bins into coherent surface triangles
-        val maxEdgeLen = (voxelMeters * 5.2f).coerceIn(0.45f, 1.35f)
-        for (v in 0 until elBins - 1) {
-            for (u in 0 until azBins) {
-                val uNext = (u + 1) % azBins
-                val a = gridCellIdx[v * azBins + u]
-                val b = gridCellIdx[v * azBins + uNext]
-                val c = gridCellIdx[(v + 1) * azBins + uNext]
-                val d = gridCellIdx[(v + 1) * azBins + u]
+        val maxEdgeSq = (voxelMeters * 2.65f) * (voxelMeters * 2.65f)
 
-                if (a >= 0 && b >= 0 && c >= 0) {
-                    if (finalPos[a].distanceTo(finalPos[b]) <= maxEdgeLen &&
-                        finalPos[b].distanceTo(finalPos[c]) <= maxEdgeLen &&
-                        finalPos[c].distanceTo(finalPos[a]) <= maxEdgeLen
-                    ) {
-                        tris.add(baseOffset + a)
-                        tris.add(baseOffset + b)
-                        tris.add(baseOffset + c)
-                    }
-                }
-                if (a >= 0 && c >= 0 && d >= 0) {
-                    if (finalPos[a].distanceTo(finalPos[c]) <= maxEdgeLen &&
-                        finalPos[c].distanceTo(finalPos[d]) <= maxEdgeLen &&
-                        finalPos[d].distanceTo(finalPos[a]) <= maxEdgeLen
-                    ) {
-                        tris.add(baseOffset + a)
-                        tris.add(baseOffset + c)
-                        tris.add(baseOffset + d)
-                    }
-                }
+        // Helper to connect a 2x2 patch of 3D voxels into 1 or 2 triangles if geometrically close
+        fun connectQuad(a: VoxelNode, b: VoxelNode?, c: VoxelNode?, d: VoxelNode?) {
+            fun close(u: VoxelNode, v: VoxelNode): Boolean {
+                val dx = u.smoothX - v.smoothX
+                val dy = u.smoothY - v.smoothY
+                val dz = u.smoothZ - v.smoothZ
+                return dx * dx + dy * dy + dz * dz <= maxEdgeSq
+            }
+            if (b != null && c != null && close(a, b) && close(b, c) && close(c, a)) {
+                tris.add(a.vertexIndex); tris.add(b.vertexIndex); tris.add(c.vertexIndex)
+                a.hasFace = true; b.hasFace = true; c.hasFace = true
+            }
+            if (c != null && d != null && close(a, c) && close(c, d) && close(d, a)) {
+                tris.add(a.vertexIndex); tris.add(c.vertexIndex); tris.add(d.vertexIndex)
+                a.hasFace = true; c.hasFace = true; d.hasFace = true
+            } else if (b != null && d != null && c == null && close(a, b) && close(b, d) && close(d, a)) {
+                tris.add(a.vertexIndex); tris.add(b.vertexIndex); tris.add(d.vertexIndex)
+                a.hasFace = true; b.hasFace = true; d.hasFace = true
             }
         }
 
-        // Recompute smooth vertex normals from triangulated faces where available
+        // Lookup with ±1 perpendicular slab tolerance so slightly tilted walls/floors connect smoothly
+        fun findNearestInSlab(gx: Int, gy: Int, gz: Int, axis: Int): VoxelNode? {
+            voxels[packGridKey(gx, gy, gz)]?.let { return it }
+            return when (axis) {
+                0 -> voxels[packGridKey(gx, gy + 1, gz)] ?: voxels[packGridKey(gx, gy - 1, gz)] // XZ slab (tolerate ±1 Y)
+                1 -> voxels[packGridKey(gx, gy, gz + 1)] ?: voxels[packGridKey(gx, gy, gz - 1)] // XY slab (tolerate ±1 Z)
+                else -> voxels[packGridKey(gx + 1, gy, gz)] ?: voxels[packGridKey(gx - 1, gy, gz)] // ZY slab (tolerate ±1 X)
+            }
+        }
+
+        for (node in voxels.values) {
+            val gx = node.gx
+            val gy = node.gy
+            val gz = node.gz
+
+            // 1. XZ horizontal surface patch (floors, ceilings, tabletops, shelves)
+            val xzB = findNearestInSlab(gx + 1, gy, gz, 0)
+            val xzC = findNearestInSlab(gx + 1, gy, gz + 1, 0)
+            val xzD = findNearestInSlab(gx, gy, gz + 1, 0)
+            if ((xzB != null && xzC != null) || (xzC != null && xzD != null) || (xzB != null && xzD != null)) {
+                connectQuad(node, xzB, xzC, xzD)
+            }
+
+            // 2. XY vertical wall patch (walls facing ±Z)
+            val xyB = findNearestInSlab(gx + 1, gy, gz, 1)
+            val xyC = findNearestInSlab(gx + 1, gy + 1, gz, 1)
+            val xyD = findNearestInSlab(gx, gy + 1, gz, 1)
+            if ((xyB != null && xyC != null) || (xyC != null && xyD != null) || (xyB != null && xyD != null)) {
+                connectQuad(node, xyB, xyC, xyD)
+            }
+
+            // 3. ZY vertical wall patch (walls facing ±X)
+            val zyB = findNearestInSlab(gx, gy, gz + 1, 2)
+            val zyC = findNearestInSlab(gx, gy + 1, gz + 1, 2)
+            val zyD = findNearestInSlab(gx, gy + 1, gz, 2)
+            if ((zyB != null && zyC != null) || (zyC != null && zyD != null) || (zyB != null && zyD != null)) {
+                connectQuad(node, zyB, zyC, zyD)
+            }
+        }
+
+        // Emit oriented micro-surfel quads for any isolated detail voxel so sparse SLAM/furniture points stay visible in STL/OBJ/GLB
+        val halfSurfel = voxelMeters * 0.46f
+        for (node in voxels.values) {
+            if (node.hasFace) continue
+            val nrm = when (node.dominantType) {
+                SpatialPoint.SURFACE_FLOOR -> Vec3(0f, 1f, 0f)
+                SpatialPoint.SURFACE_CEILING -> Vec3(0f, -1f, 0f)
+                else -> Vec3(meanX - node.smoothX, meanY - node.smoothY, meanZ - node.smoothZ).normalize()
+            }
+            val ref = if (abs(nrm.y) < 0.85f) Vec3(0f, 1f, 0f) else Vec3(1f, 0f, 0f)
+            val tU = nrm.cross(ref).normalize() * halfSurfel
+            val tV = nrm.cross(tU).normalize() * halfSurfel
+            val c = Vec3(node.smoothX, node.smoothY, node.smoothZ)
+
+            val p0 = c - tU - tV
+            val p1 = c + tU - tV
+            val p2 = c + tU + tV
+            val p3 = c - tU + tV
+
+            val i0 = addVertex(verts, norms, cols, types, p0.x, p0.y, p0.z, nrm.x, nrm.y, nrm.z, node.argb, node.dominantType)
+            val i1 = addVertex(verts, norms, cols, types, p1.x, p1.y, p1.z, nrm.x, nrm.y, nrm.z, node.argb, node.dominantType)
+            val i2 = addVertex(verts, norms, cols, types, p2.x, p2.y, p2.z, nrm.x, nrm.y, nrm.z, node.argb, node.dominantType)
+            val i3 = addVertex(verts, norms, cols, types, p3.x, p3.y, p3.z, nrm.x, nrm.y, nrm.z, node.argb, node.dominantType)
+            tris.add(i0); tris.add(i1); tris.add(i2)
+            tris.add(i0); tris.add(i2); tris.add(i3)
+        }
+
         recomputeNormals(verts, norms, tris, baseOffset)
     }
 
