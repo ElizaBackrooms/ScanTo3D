@@ -14,10 +14,10 @@
 
 ---
 
-## Releases & Trailer
+## Downloads & Trailer
 
-- **Latest Release (`v4.0`):** View release notes and downloads at [**Release v4.0**](https://github.com/ElizaBackrooms/ScanTo3D/releases/tag/v4.0)
-- **Launch Trailer (`1080p`):** Watch `LidarForge3D_Launch_Trailer.mp4` attached to [**Release v4.0**](https://github.com/ElizaBackrooms/ScanTo3D/releases/tag/v4.0)
+- **Android APK (`v5.0`):** Download the latest build from [**Latest Release**](https://github.com/ElizaBackrooms/ScanTo3D/releases/latest)
+- **Launch Trailer (`1080p`):** Watch `LidarForge3D_Launch_Trailer.mp4` attached to [**Latest Release**](https://github.com/ElizaBackrooms/ScanTo3D/releases/latest)
 
 ---
 
