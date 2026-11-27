@@ -6,7 +6,7 @@
 
 **Scan any real room with your Android phone and export ready-to-render 3D geometry for Bryce 3D, Blender, and VertexForge.**
 
-[![Latest Release](https://img.shields.io/github/v/release/ElizaBackrooms/ScanTo3D?color=00bcd4&label=Download%20APK)](https://github.com/ElizaBackrooms/ScanTo3D/releases/latest)
+[![Latest Release](https://img.shields.io/github/v/release/ElizaBackrooms/ScanTo3D?color=00bcd4&label=Release)](https://github.com/ElizaBackrooms/ScanTo3D/releases/latest)
 ![Platform](https://img.shields.io/badge/Android-7.0%2B%20(API%2024%E2%80%9336)-3ddc84)
 ![Offline](https://img.shields.io/badge/Privacy-100%25%20Offline%20(Camera%20Only)-0a7ea4)
 
@@ -14,9 +14,9 @@
 
 ---
 
-## Downloads & Trailer
+## Releases & Trailer
 
-- **Android APK (`v4.0`):** Grab `LidarForge3D-v4.0.apk` from the [**Latest Release**](https://github.com/ElizaBackrooms/ScanTo3D/releases/latest)
+- **Latest Release (`v4.0`):** View release notes and downloads at [**Release v4.0**](https://github.com/ElizaBackrooms/ScanTo3D/releases/tag/v4.0)
 - **Launch Trailer (`1080p`):** Watch `LidarForge3D_Launch_Trailer.mp4` attached to [**Release v4.0**](https://github.com/ElizaBackrooms/ScanTo3D/releases/tag/v4.0)
 
 ---
@@ -55,7 +55,7 @@ LidarForge 3D is **100% offline by design**:
 
 ## Building from Source
 
-**Requirements:** JDK 17+, Android SDK (compileSdk `36.1`, minSdk `24`), Gradle `9.3.1`.
+**Requirements:** JDK 21+ (or Android Studio / Google AI Studio), Android SDK (`compileSdk 36.1`, `minSdk 24`), Gradle `9.3.1`.
 
 ```bash
 git clone https://github.com/ElizaBackrooms/ScanTo3D.git
